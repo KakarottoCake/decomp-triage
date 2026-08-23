@@ -3,6 +3,10 @@
 Triage tools for GameCube / Wii matching decompilation with Metrowerks CodeWarrior,
 plus a machine-readable catalogue of `mwcceppc` compiler behaviours.
 
+These sort failing functions into buckets and tell you which bucket is which. They do not
+write source and they do not suggest fixes. Everything below is a worklist for a person who
+already knows the codebase; the hard part is downstream of anything here.
+
 Built against [doldecomp/sms](https://github.com/doldecomp/sms) (Super Mario Sunshine,
 GMSJ01, MWCC `GC/1.2.5`), but nothing here is Sunshine-specific — any dtk-based project
 with an `objdiff.json` can run it.
@@ -127,8 +131,6 @@ The schema is deliberately identical to
 python tools/levers.py --repo ../sm64ds-decomp --catalogue notes/levers.jsonl --arch arm
 ```
 
-That project originated the idea and this catalogue is the PowerPC counterpart to it.
-
 **A lever proven on one compiler is only a hypothesis on the other**, which is why entries
 carry `compiler_version`. A worked example of why: their `volatile-local-stack-slot` lever is
 the sibling of this project's `dead-stack-slots-never-reclaimed`, but the mechanism is the
@@ -140,9 +142,9 @@ here against all 605 frame-only functions and **does not hold** for mwcceppc.
 
 ## Prior art and credit
 
-- **[tangosdev/sm64ds-decomp](https://github.com/tangosdev/sm64ds-decomp)** — originated the
-  lever-catalogue format this copies, and its `notes/mwccarm-codegen.md` is the most substantial
-  written record of CodeWarrior matching technique anywhere.
+- **[tangosdev/sm64ds-decomp](https://github.com/tangosdev/sm64ds-decomp)** — the
+  `notes/levers.jsonl` format is theirs; this catalogue reuses the schema so one reader loads
+  either. Cited for the file format, not as a model for how to run a decompilation project.
 - **[cadmic/mwcc-debugger](https://github.com/cadmic/mwcc-debugger)** — dumps MWCC's internal
   state pass by pass. Its README is the public reference for the stack-allocation behaviour and
   the register allocator's priority levels that this work rests on.
