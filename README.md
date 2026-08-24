@@ -3,9 +3,10 @@
 Triage tools for matching decompilation with Metrowerks CodeWarrior, plus a
 machine-readable catalogue of compiler behaviours.
 
-They answer one question in six ways: **this function doesn't match — why, and is it
-worth my time?** None of them write source. They sort, measure, and point; the fix is
-yours.
+They answer one question in eight ways: **this function doesn't match — why, and is it
+worth my time?** Only `gen-variants.py` writes source, and only candidates for
+`try-variants.py` to measure and throw away. The rest sort, measure, and point; the fix
+is yours.
 
 Built against [doldecomp/sms](https://github.com/doldecomp/sms) (Super Mario Sunshine,
 GMSJ01, MWCC `GC/1.2.5`). Nothing is Sunshine-specific — any dtk-based project with an
@@ -22,7 +23,9 @@ project's `tools/` and go.
 | `structural-diff.py` | *what kind* of wrong is this function |
 | `data-pool-diff.py` | is the problem actually in the data, not the code |
 | `try-variants.py` | which of these candidate rewrites is closest |
+| `gen-variants.py` | *generates* those candidates — safe respelling families |
 | `review-lint.py` | will a maintainer send this back |
+| `unit-deps.py` | which unit should I work on next, and what gates what |
 | `levers.py` | has anyone solved this symptom before |
 
 ### `stack-frame-diff.py` — the sort
@@ -112,15 +115,72 @@ source on success, failure, and Ctrl-C.
 A variant that reaches the right frame but the wrong length tells you the shape is
 plausible and the body isn't — which is more than a percentage ever tells you.
 
+### `gen-variants.py` — the candidates
+
+```bash
+python tools/gen-variants.py src/Foo.cpp 'int TFoo::bar()' > variants.txt
+python tools/try-variants.py src/Foo.cpp 'int TFoo::bar()' variants.txt
+```
+
+The only tool here that writes source, and only throwaway candidates for `try-variants.py`
+to measure. MWCC emits different code for semantically identical spellings, so when a
+function is a few instructions away the fix is usually a *respelling*, not new logic.
+
+Eight families, safest first: `bool`, `compare`, `return`, `decl-order`, `local-form`,
+`reassociate` (integers only — reassociating floats changes results), `param-inversion`,
+`bitfield`.
+
+`decl-order` is the one to reach for on a frame or register-colouring miss; it is the only
+family that moves layout rather than arithmetic. Measured on one already-matching function:
+writing a condition as `x != 0` instead of `x` moved the frame by +8 while emitting the same
+number of code bytes, so the `bool` family is a genuine frame lever too.
+
+What it will **not** generate, by design: `volatile` locals, empty switch cases to reshape a
+jump table, and `#pragma` peephole/scheduling/fp_contract toggles. Those close byte gaps by
+producing source nobody would write. `cast` and `width` are also excluded — they change
+semantics and must be checked by hand rather than swept.
+
 ### `review-lint.py` — spend the maintainer's attention on real problems
 
 Encodes review comments a maintainer already made, so nobody has to make them twice.
 Diff-scoped by default, so switching it on mid-project doesn't bury you.
 
 Rules live in `tools/review-rules.jsonl` because they're per-project by nature; the
-shipped set is an example from one GameCube project. One rule is built in rather than
-configurable: a local array read only at `[0]`, the signature of a match bought with
-source nobody would write.
+shipped set is an example from one GameCube project.
+
+Some checks are built in rather than configurable, because they aren't conventions — each
+is a signature of source invented to reach a match, and **a wrong function can match
+100%**, so no build check will ever catch them:
+
+- **write-only-array** — a local array read only at `[0]`, usually there to move the frame.
+- **raw-offset-cast** — reaching a field via `*(T*)((u8*)p + 0xNN)`. It encodes a layout
+  guess nothing verifies. Measured across 579 files on the source project: 10 hits, so it
+  is high-signal rather than noise.
+- **invented-helper-dead / -single** — a file-local `static` helper that is never
+  referenced, or has exactly one call site. Headers are exempt: an inline in a class
+  header is that class's API, not a guess about a translation unit.
+
+Two calibrations in `invented-helper` are worth knowing before you tune it. It counts
+*every* mention of the name, not `name(`, because a callback handed to the engine is
+referenced by address and never called — counting call syntax alone reported 153 false
+positives instead of 16. And an uncalled `static` named `dummy` is skipped, since that is
+a common idiom for forcing section order. **`dead` does not mean delete**: check the
+linker map first, because a symbol present there is real code that was dead-stripped.
+
+### `unit-deps.py` — what to work on next
+
+```bash
+NM=path/to/nm python tools/unit-deps.py --all      # leaf units: the cheapest work
+NM=... python tools/unit-deps.py --chain           # units that unblock the most others
+NM=... python tools/unit-deps.py --deps src/Foo.cpp
+```
+
+The only tool here that works *between* units rather than inside one function. Builds the
+symbol-level dependency graph from the object files and answers which units nothing else is
+waiting on (start here), which ones unblock the most others (do these for leverage), and why
+a given unit is blocked.
+
+Ported from the dependency graph in [doldecomp/melee](https://github.com/doldecomp/melee).
 
 ### `levers.py` + `levers.jsonl` — write the folklore down
 

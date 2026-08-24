@@ -167,6 +167,62 @@ def write_only_arrays(text, wanted):
     return hits
 
 
+FIX_INVENTED = {
+    "dead": "check mario.MAP before touching it. A symbol present there is real "
+            "retail code that was dead-stripped -- it must stay, unreferenced or "
+            "not. Absent from the MAP and added by you, it is an inline the "
+            "compiler never sees: a claim about the original that nothing supports, "
+            "so delete it",
+    "single": "a one-use helper usually belongs at its call site, or is a method on "
+              "the class it operates on. Fold it unless the boundary is proven",
+}
+
+
+def invented_helpers(text, wanted, path):
+    """File-local helper functions that no longer earn their place.
+
+    Built in rather than configurable, because it is not a project convention --
+    it is the signature of source invented to reach a match. A reviewer reads a
+    `static` helper in a .cpp as a claim that the original had an inline function
+    there. Two shapes make that claim badly:
+
+      * never referenced -- the claim is not even used. PR #152 shipped two of
+        these; the reviewer caught one and missed the other.
+      * one call site -- the abstraction earns nothing, and a reviewer will ask
+        why it exists at all.
+
+    Headers are skipped: an inline in a class header is that class's API, not a
+    guess about a translation unit. Only the definition line is reported, so this
+    stays quiet unless the helper itself is part of the change.
+    """
+    if not path.endswith((".c", ".cpp")):
+        return []
+
+    hits = []
+    for m in re.finditer(
+        r"^[ 	]*static\s+(?:inline\s+)?[\w:<>,&*\s]+?[\s*&](\w+)\s*\([^;{]*\)\s*\{",
+        text, re.M,
+    ):
+        name = m.group(1)
+        lineno = text.count(chr(10), 0, m.start()) + 1
+        if wanted is not None and lineno not in wanted:
+            continue
+        if re.fullmatch(r"dummy_?\d*", name):
+            continue  # project idiom: an uncalled static that forces section order
+        # Any mention of the name, not just `name(` -- a callback handed to the
+        # engine is referenced by address and never "called". Counting only call
+        # syntax reported 153 dead helpers across the tree, nearly all of them
+        # legitimate callbacks.
+        uses = len(re.findall(r"\b" + re.escape(name) + r"\b", text)) - 1
+        if uses <= 0:
+            hits.append((lineno, name, "dead",
+                         f"{name}() is defined here and never referenced"))
+        elif uses == 1:
+            hits.append((lineno, name, "single",
+                         f"{name}() has exactly one call site"))
+    return hits
+
+
 def scan(path, wanted, rules):
     full = os.path.join(root_dir, path)
     if not os.path.isfile(full):
@@ -197,6 +253,14 @@ def scan(path, wanted, rules):
             "outranks a match",
             "built in: the signature of a match bought with unnatural source",
             f"{name}[{size}]", False,
+        ))
+
+    for lineno, name, kind, msg in invented_helpers(text, wanted, path):
+        findings.append((
+            lineno, f"invented-helper-{kind}", msg, FIX_INVENTED[kind],
+            "a maintainer review: 'It is probably best to avoid this inline "
+            "until it can be proven / disproven'",
+            name, kind != "dead",
         ))
 
     return sorted(findings)
