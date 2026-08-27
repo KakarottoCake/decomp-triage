@@ -46,9 +46,9 @@ If you want cheap matches, look at the "other" bucket instead: frame already
 correct, code differs. Those are register allocation, scheduling and expression
 order -- they have a gradient, and the usual tools work on them.
 
-To find out what is actually in a frame and which inlined call put it there,
-run mwcc-izer's `stack -w` on the function; this script exists to tell you
-*which* functions are worth pointing it at, across the whole tree at once.
+Working out what is actually in a frame needs a compiler-state dumper, which is
+outside what this script does; this script exists to tell you *which* functions
+are worth pointing one at, across the whole tree at once.
 
 Usage
 -----

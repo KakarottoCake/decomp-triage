@@ -109,8 +109,12 @@ def changed_lines(base):
     try:
         diff = subprocess.run(
             ["git", "diff", "-U0", f"{base}...HEAD", "--", "*.cpp", "*.hpp", "*.h"],
-            cwd=root_dir, capture_output=True, text=True, check=True,
-        ).stdout
+            # Decode explicitly. `text=True` uses the locale codec, which on
+            # Windows is cp1252 and cannot decode non-Latin string literals
+            # (this tree has Japanese ones) -- git then hands back None and the
+            # caller dies on `None.splitlines()` with no hint as to why.
+            cwd=root_dir, capture_output=True, check=True,
+        ).stdout.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError as exc:
         sys.exit(f"git diff against {base!r} failed: {exc.stderr.strip()}")
 

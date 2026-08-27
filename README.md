@@ -3,7 +3,7 @@
 Triage tools for matching decompilation with Metrowerks CodeWarrior, plus a
 machine-readable catalogue of compiler behaviours.
 
-They answer one question in eight ways: **this function doesn't match — why, and is it
+They answer one question in nine ways: **this function doesn't match — why, and is it
 worth my time?** Only `gen-variants.py` writes source, and only candidates for
 `try-variants.py` to measure and throw away. The rest sort, measure, and point; the fix
 is yours.
@@ -20,6 +20,7 @@ project's `tools/` and go.
 | | question it answers |
 | --- | --- |
 | `stack-frame-diff.py` | which bucket is each failure in, and which are worth working |
+| `scaffold-scan.py` | is anything left once the frame delta stops hiding it |
 | `structural-diff.py` | *what kind* of wrong is this function |
 | `data-pool-diff.py` | is the problem actually in the data, not the code |
 | `try-variants.py` | which of these candidate rewrites is closest |
@@ -62,6 +63,50 @@ work the **structural** bucket.
 `--by-idiom` is usually more useful than the per-file view: in a rushed, copy-pasted
 codebase the same virtual exists dozens of times, so one reconstruction can be worth a
 dozen matches.
+
+### `scaffold-scan.py` — look underneath the frame
+
+```bash
+python tools/scaffold-scan.py src/GC2D/Foo.cpp mario/GC2D/Foo
+python tools/scaffold-scan.py src/GC2D/Foo.cpp mario/GC2D/Foo --only barFn bazFn
+```
+
+When our frame is the wrong size, every stack displacement in the function shifts, so the
+diff renders as a wall of unrelated-looking offset changes and the real code mismatch
+underneath is invisible. Sizing a throwaway local to the delta cancels the shift:
+
+```cpp
+void TFoo::bar()
+{
+    char trash[0x40];   // TEMPORARY: cancels the frame delta so the diff is readable
+    ...
+}
+```
+
+This script does that for every failing function in a unit, rebuilds the one object,
+counts what is left, and restores the file — on success, on failure, and on Ctrl-C. The
+output splits the unit in two: functions that drop to nearly nothing are **one fix away**,
+functions that stay at forty have **real structural work**. That ranking is the point; it
+tells you where the next hour goes.
+
+It also classifies the leftover diff lines into three kinds, which is the difference
+between "there is work here" and "there is not":
+
+| kind | meaning |
+| --- | --- |
+| **real** | different opcode, different immediate, or an instruction on one side only |
+| **regperm** | same instructions, the allocator picked different registers |
+| **slot** | same instructions, a stack slot moved |
+
+A function whose leftovers are entirely `regperm` and `slot` has no code work left — only
+frame size and register colouring, which is the hardest and least tractable bucket. Do not
+spend a day discovering that by hand.
+
+**The scaffold is a measuring device, not source.** Shipping one is fabricated padding.
+`review-lint.py` carries a `diagnostic-scaffold-left-in` rule for exactly this; keep it at
+zero.
+
+Set `DECOMP_VERSION` if your build directory is not `build/GMSJ01`.
 
 ### `structural-diff.py` — what kind of wrong
 
@@ -223,8 +268,6 @@ function and does not hold for mwcceppc.
 - **[tangosdev/sm64ds-decomp](https://github.com/tangosdev/sm64ds-decomp)** — the
   `levers.jsonl` format is theirs and this reuses the schema. Cited for the file format,
   not as a model for running a decompilation project.
-- **mwcc-izer** — a private tool used for some per-function frame and inlining analysis
-  cited in the catalogue. Not publicly available.
 - **[doldecomp/sms](https://github.com/doldecomp/sms)** — where every measurement comes from.
 
 ## License
