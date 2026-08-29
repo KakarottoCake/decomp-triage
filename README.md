@@ -141,11 +141,40 @@ fine. Retail's `.data` simply began with 40 bytes of constants the compiler gene
 then optimised the uses of — the footprint of a **precompiled header** the original build
 used and we don't. Supplying equivalents made the data byte-identical.
 
-Two traps it has to handle, both of which produce confidently wrong answers:
+Three traps it has to handle, all of which produce confidently wrong answers:
 
 - Compiler-generated `@NNNN` names are a **per-compilation counter**, not an identity. The
   same literal is `@1490` in one build and `@597` in another. Compare by content.
 - `.bss` symbols have no content at all. Compare those by size.
+- **"We emit a symbol the target does not" is only half a sentence.** The extracted objects
+  you diff against are what the *original linker kept*. Anything that build dead-stripped
+  is missing from them while still having been real, and the link map still lists it, with
+  a `........` address and an `UNUSED` marker. Read from the objects alone, a dead-stripped
+  symbol is indistinguishable from one you invented — and the two want opposite fixes.
+
+That third one is not a rare edge case, and it is the reason this tool now reads the link
+map. On the project it was built against, **204 symbols across 185 sections were on the
+wrong side of that line — 5.1% of every "the target does not have this" it used to print.**
+Two header-level symbols accounted for most of it: one appears in 103 units and never in a
+single extracted object, another in 69. Acting on the old output cost that project **4,416
+bytes of matched data** in one commit, which had to be caught in review and reverted.
+
+Output now separates them:
+
+```
+we emit 1 symbol(s) retail does not: dummyMactorStringValue1
+1 symbol(s) look extra but the link map lists them for this file: SMS_NO_MEMORY_MESSAGE
+    -> the original build HAD these and dead-stripped them, so they are absent
+       from the extracted object only. Keep them
+```
+
+The first is genuinely yours and is a candidate for deletion. The second is evidence your
+source is **right**. Deleting it removes correct source, and when it came from a widely
+included header, it does so across every unit that shares it.
+
+Set `DECOMP_MAP` if your link map is not at `orig/$DECOMP_VERSION/files/mario.MAP`. Without
+a map the tool falls back to its previous behaviour and simply does not draw the
+distinction.
 
 ### `try-variants.py` — measure instead of guessing
 

@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -136,7 +138,47 @@ def read_data_symbols(path: Path) -> dict[str, list[dict]]:
     return out
 
 
-def compare_section(tsyms: list[dict], osyms: list[dict]) -> dict | None:
+VERSION = os.environ.get("DECOMP_VERSION", "GMSJ01")
+RETAIL_MAP = Path(os.environ.get(
+    "DECOMP_MAP", str(root_dir / "orig" / VERSION / "files" / "mario.MAP")))
+_map_index = None
+
+
+def retail_map_symbols(source: str):
+    """Symbol names the linker map records for one source file, or None.
+
+    The extracted objects you diff against are what the ORIGINAL LINKER KEPT.
+    Anything the original build dead-stripped is missing from them while still
+    having been real, and the link map still lists it -- with a `........`
+    address and an UNUSED marker.
+
+    So "we emit a symbol the target does not" is only half a sentence. Read from
+    the objects alone it is indistinguishable from "we invented this", and the
+    two want opposite fixes: keep it, or delete it. Deleting a dead-stripped
+    symbol removes correct source, and when it came from a widely included
+    header that can cost matched data across every unit that shares it.
+
+    Set DECOMP_MAP if your map is not at orig/$DECOMP_VERSION/files/mario.MAP.
+    Without a map this returns None and the tool behaves as it did before.
+    """
+    global _map_index
+    if _map_index is None:
+        _map_index = {}
+        if not RETAIL_MAP.exists():
+            return None
+        text = RETAIL_MAP.read_text(encoding="utf-8", errors="replace")
+        # `  UNUSED   000010 ........ SomeSymbol Lib.a File.cpp`
+        # The linked form ends the same way: <symbol> <lib>.a <source file>
+        for m in re.finditer(r"(\S+)\s+\S+\.a\s+(\S+\.(?:cpp|c|s))\s*$",
+                             text, re.MULTILINE):
+            _map_index.setdefault(m.group(2), set()).add(m.group(1))
+    if not _map_index:
+        return None
+    return _map_index.get(Path(source).name, set())
+
+
+def compare_section(tsyms: list[dict], osyms: list[dict],
+                    source: str = "") -> dict | None:
     """What differs between one section in retail and the same section in ours."""
     # `@NNNN` names are a per-compilation counter, not an identity: the same
     # literal is @1490 in one build and @597 in another. Comparing those by name
@@ -171,6 +213,15 @@ def compare_section(tsyms: list[dict], osyms: list[dict]) -> dict | None:
     extra = [s for s in osyms
              if not s["name"].startswith("@") and s["name"] not in tnames]
 
+    # Split "extra" against the link map. A symbol the map records for this
+    # source file is one the original build HAD and stripped, so its presence is
+    # evidence the source is right. Only the remainder is genuinely ours.
+    known = retail_map_symbols(source) if source else None
+    dead_stripped = []
+    if known:
+        dead_stripped = [s for s in extra if s["name"] in known]
+        extra = [s for s in extra if s["name"] not in known]
+
     tpos = {s["name"]: s["offset"] for s in tsyms}
     opos = {s["name"]: s["offset"] for s in osyms}
     tsize = {s["name"]: s["size"] for s in tsyms}
@@ -181,7 +232,8 @@ def compare_section(tsyms: list[dict], osyms: list[dict]) -> dict | None:
              for n in shared if tpos[n] != opos[n]]
     resized = [{"name": n, "target": tsize[n], "ours": osize[n]}
                for n in shared if tsize[n] != osize[n]]
-    if not (missing or extra or moved or resized or missing_generated):
+    if not (missing or extra or moved or resized or missing_generated
+            or dead_stripped):
         return None
 
     # A single shift shared by every moved symbol means the pool head is wrong,
@@ -189,6 +241,7 @@ def compare_section(tsyms: list[dict], osyms: list[dict]) -> dict | None:
     deltas = {m["target"] - m["ours"] for m in moved}
     head_shift = deltas.pop() if len(deltas) == 1 and moved else None
     return {"missing": missing, "extra": extra, "moved": moved, "resized": resized,
+            "dead_stripped": dead_stripped,
             "head_shift": head_shift,
             "missing_generated": [
                 {k: v for k, v in s.items() if k != "body"} for s in missing_generated],
@@ -228,10 +281,12 @@ def main(argv: list[str] | None = None) -> int:
             if tb is not None and tb == ob:
                 clean += 1
                 continue
-            diff = compare_section(tdata.get(sec, []), odata.get(sec, []))
+            src = (unit.get("metadata") or {}).get("source_path", "")
+            diff = compare_section(tdata.get(sec, []), odata.get(sec, []), src)
             if diff is None:
                 if tb is not None and ob is not None and len(tb) != len(ob):
                     diff = {"missing": [], "extra": [], "moved": [], "resized": [],
+                            "dead_stripped": [],
                             "head_shift": None, "missing_generated": [],
                             "missing_bytes": len(tb) - len(ob),
                             "size_only": (len(tb), len(ob))}
@@ -272,6 +327,12 @@ def main(argv: list[str] | None = None) -> int:
         if r["extra"]:
             print(f"  we emit {len(r['extra'])} symbol(s) retail does not: "
                   f"{', '.join(s['name'] for s in r['extra'][:5])}")
+        if r.get("dead_stripped"):
+            print(f"  {len(r['dead_stripped'])} symbol(s) look extra but the link map "
+                  f"lists them for this file: "
+                  f"{', '.join(s['name'] for s in r['dead_stripped'][:5])}")
+            print("      -> the original build HAD these and dead-stripped them, so they "
+                  "are absent from the extracted object only. Keep them")
         if r["resized"]:
             for s in r["resized"][:4]:
                 print(f"  size differs: {s['name']} is {s['ours']} bytes, "
@@ -297,7 +358,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  showing {shown} of {len(rows)}; --detail for all")
 
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        # Symbol payloads are raw `bytes`, which json cannot encode. Hex is the
+        # useful form anyway -- it is what you paste back when comparing two
+        # units' constants by content rather than by size.
+        def encode(o):
+            if isinstance(o, (bytes, bytearray)):
+                return o.hex()
+            raise TypeError(f"cannot serialise {o.__class__.__name__}")
+
+        Path(args.json_out).write_text(
+            json.dumps(rows, indent=1, default=encode), encoding="utf-8"
+        )
         print(f"  wrote {args.json_out}")
     return 0
 
