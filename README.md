@@ -109,6 +109,11 @@ A function whose leftovers are entirely `regperm` and `slot` has no code work le
 frame size and register colouring, which is the hardest and least tractable bucket. Do not
 spend a day discovering that by hand.
 
+Register colouring is solvable, but last: leave it until the class and its related classes
+are decompiled, since the fix is usually a missing inline, and raw `u8*` casts cause
+regswaps on their own. After that, a compiler-state dumper such as mwcc-debugger shows which
+virtual registers conflict.
+
 **The scaffold is a measuring device, not source.** Shipping one is fabricated padding.
 `review-lint.py` carries a `diagnostic-scaffold-left-in` rule for exactly this; keep it at
 zero.
