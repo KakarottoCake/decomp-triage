@@ -29,8 +29,11 @@ remains needs a real disassembler.
 Three rules keep the remaining categories trustworthy, and the middle one is the
 one that matters:
 
-  * Displacements off r1 are ignored -- that is the frame, and stack-frame-diff
-    owns it.
+  * Displacements off r1 are counted as stack slots, never as struct fields,
+    and a function whose differences are only register colouring and slot
+    movement reports as `slots` (allocator placement, no code work). Truly
+    unreadable differences still land in `other`, so `unclassified` keeps its
+    meaning.
   * A displacement is only called a struct field if its base register is an
     object pointer. MWCC addresses statics and string literals as
     `lis rX, sym@ha` + `addi rD, rX, sym@l`, which puts a data offset in exactly
@@ -107,7 +110,10 @@ SUBST_MEANING = {
     frozenset(("stw", "sth")): "integer width on a store -- check the field's declared type",
     frozenset(("lwz", "op31")): "displacement vs indexed addressing -- usually a[i] written "
                                 "as a computed pointer, or a loop induction variable",
-    frozenset(("addi", "op31")): "displacement vs indexed addressing, as above",
+    frozenset(("addi", "op31")): "displacement vs indexed addressing, as above -- "
+                                "but with a zero immediate on the addi side it is one register "
+                                "copy spelled two ways (mr vs addi r,r,0), which is allocator "
+                                "noise, not a type or addressing difference",
     frozenset(("addi", "lwz")): "one side computes an address, the other dereferences -- "
                                 "a missing or extra level of indirection",
     frozenset(("stw", "addi")): "one side stores, the other only computes -- an assignment "
@@ -175,6 +181,24 @@ def _branch_regs_equal(op: int, a: int, b: int) -> bool:
     return (a ^ b) & 0x03FF0000 == 0  # bc: BO/BI unchanged
 
 
+def _is_same_move(addi_word, or_word):
+    """True for (`addi rD,rS,0`, `mr rD,rS`), i.e. one register copy.
+
+    Field trap this exists because of: XO-form logical ops name their fields
+    RA/RS/RB, not RT/RA/RB, so `or RA,RS,RB` sits at shifts 16/21/11 while a
+    D-form `addi rD,rA,imm` sits at 21/16. Reading the or-word with D-form
+    shifts decodes the destination as a source. Only the exact zero-immediate,
+    non-recording form counts: any other immediate is real address formation.
+    """
+    if addi_word >> 26 != 14 or (addi_word & 0xFFFF) != 0:
+        return False
+    if or_word >> 26 != 31 or ((or_word >> 1) & 0x3FF) != 444 or or_word & 1:
+        return False
+    return ((addi_word >> 21) & 0x1F == (or_word >> 16) & 0x1F
+            and (addi_word >> 16) & 0x1F == (or_word >> 21) & 0x1F
+            and (or_word >> 21) & 0x1F == (or_word >> 11) & 0x1F)
+
+
 def classify(tcode: bytes, ocode: bytes) -> dict:
     """What differs between the target and ours, as counted components.
 
@@ -188,13 +212,21 @@ def classify(tcode: bytes, ocode: bytes) -> dict:
                 "target_instr": len(tw), "our_instr": len(ow)}
 
     fields, pools, consts, substs = [], [], [], Counter()
-    regs = other = branches = masks = 0
+    vtables: list = []
+    regs = other = branches = masks = frame = 0
     data_regs = data_base_registers(tw) | data_base_registers(ow)
     for idx, (a, b) in enumerate(zip(tw, ow)):
         if a == b:
             continue
         pa, pb = a >> 26, b >> 26
         if pa != pb:
+            # A zero-immediate addi against an or-with-identical-sources is
+            # one register copy in two spellings (mr vs addi r,r,0): allocator
+            # noise, not addressing and not a type. Anything else stays a
+            # substitution.
+            if _is_same_move(a, b) or _is_same_move(b, a):
+                regs += 1
+                continue
             substs[frozenset((mnemonic(pa), mnemonic(pb)))] += 1
             continue
         same_hi = (a ^ b) & 0xFFFF0000 == 0
@@ -206,9 +238,28 @@ def classify(tcode: bytes, ocode: bytes) -> dict:
             if pa in ADDR_FORMING and base == 0:
                 consts.append(entry)    # addi rD,0,n is li -- a real literal
             elif base == 1:
-                other += 1              # the frame; stack-frame-diff owns it
+                # A displacement off r1 is a stack slot, not a struct member.
+                # Same opcodes with moved slots is allocator placement, the same
+                # wall as register colouring. Counted separately from `other`
+                # so slot-only movement is never misread as unknown code work,
+                # and truly unknown differences still land in `other`.
+                frame += 1
             elif base in (2, 13) or base in data_regs:
                 pools.append(entry)     # a data address: sdata, or lis-derived
+            elif base == 12:
+                # r12 is the EABI indirect-call register: MWCC dispatches a
+                # virtual call as `lwz r12,0(obj); lwz r12,slot(r12); mtctr r12`.
+                # A displacement off it is a different vtable SLOT -- a different
+                # virtual method -- not a different struct member. The fixes have
+                # nothing in common, and calling this a field sends you editing a
+                # class layout that is correct.
+                #
+                # This is a guard, not a validated detector: there are currently
+                # zero r12-based displacement differences in the tree, so it has
+                # never fired. It exists so that if one appears it cannot be
+                # silently misfiled. Do not extend it into real dispatch dataflow
+                # analysis without a real case to test against.
+                vtables.append(entry)
             else:
                 fields.append(entry)
         elif pa in IMM and same_hi:
@@ -241,14 +292,17 @@ def classify(tcode: bytes, ocode: bytes) -> dict:
             other += 1
 
     out = {"kind": None, "fields": fields, "pools": pools, "consts": consts,
+           "vtables": vtables,
            "branches": branches, "masks": masks,
            # joined rather than tupled so the whole row stays JSON-serialisable
            "substs": {" <-> ".join(sorted(k)): v for k, v in substs.items()},
-           "regs": regs, "other": other}
+           "regs": regs, "frame": frame, "other": other}
 
-    named = (len(fields) + len(pools) + len(consts) + sum(substs.values())
-             + branches + masks)
-    if fields and not (pools or consts or substs or regs or other):
+    named = (len(fields) + len(pools) + len(consts) + len(vtables)
+             + sum(substs.values()) + branches + masks)
+    if vtables and not (fields or pools or consts or substs or regs or other):
+        out["kind"] = "vtables"
+    elif fields and not (pools or consts or substs or regs or other or vtables):
         out["kind"] = "fields"
     elif pools and not (fields or consts or substs or regs or other):
         out["kind"] = "pools"
@@ -262,8 +316,13 @@ def classify(tcode: bytes, ocode: bytes) -> dict:
         out["kind"] = "branches"
     elif named:
         out["kind"] = "mixed"
-    elif regs and not other:
+    elif regs and not other and not frame:
         out["kind"] = "registers"
+    elif frame and not other:
+        # Same instructions, only register colouring and/or stack slots moved.
+        # Nothing to fix in source; the allocator owns both. Kept distinct from
+        # "registers" so that label keeps its exact meaning.
+        out["kind"] = "slots"
     else:
         # Nothing recognised. This must NOT be folded into "registers": that
         # label reads as "allocator wall, skip these", and skipping a function
@@ -324,6 +383,12 @@ def describe(c: dict) -> list[str]:
             f"{'short' if sh > 0 else 'long'} before 0x{c['shift_from']:x}. "
             "Fixing it moves every function that touches this type."
         )
+    elif c.get("vtables"):
+        shown = ", ".join(f"slot 0x{f['ours']:x}->0x{f['target']:x}" for f in c["vtables"][:4])
+        lines.append(f"{len(c['vtables'])} vtable slot offset(s) ({shown}"
+                     f"{', ...' if len(c['vtables']) > 4 else ''})")
+        lines.append("-> we call the wrong virtual method. Count the virtuals in the "
+                     "base class and check declaration order; do NOT edit member layout.")
     elif c["fields"]:
         shown = ", ".join(f"{f['op']} 0x{f['ours']:x}->0x{f['target']:x}" for f in c["fields"][:4])
         lines.append(f"{len(c['fields'])} struct field offsets ({shown}"
@@ -373,6 +438,9 @@ def describe(c: dict) -> list[str]:
                      "usually a consequence of another difference, not a cause")
     if c["regs"]:
         lines.append(f"{c['regs']} register-only difference(s)")
+    if c.get("frame"):
+        lines.append(f"{c['frame']} stack-slot displacement(s) (same opcodes, "
+                     "slots moved -- allocator placement, no code work)")
     if c["other"]:
         lines.append(f"{c['other']} difference(s) not confidently classified")
     return lines
@@ -381,17 +449,21 @@ def describe(c: dict) -> list[str]:
 HEADLINE = {
     "constants": "only numbers are wrong -- cheapest thing in the bucket",
     "fields": "only struct displacements -- fix the header, not the function",
+    "vtables": "only vtable slot offsets -- a different virtual method is being "
+               "called; the class layout is fine",
     "pools": "only data addresses -- literal/static ordering, not the code",
     "types": "only opcode substitutions -- a declared type is wrong",
     "length": "instruction counts differ -- something is genuinely present or absent",
     "mixed": "several kinds at once -- see the composition",
     "registers": "register fields only, but not a clean permutation -- allocator wall",
+    "slots": "same instructions, only stack slots moved (registers may differ too) "
+             "-- allocator placement, no code work",
     "masks": "only rotate/mask fields -- a bitfield or integer width is wrong",
     "branches": "only branch targets -- the code moved, this is a symptom not a cause",
     "unclassified": "this tool could not read the differences -- not a verdict, a gap",
 }
-ORDER = ["constants", "fields", "types", "masks", "pools", "mixed", "length",
-         "branches", "registers", "unclassified"]
+ORDER = ["constants", "vtables", "fields", "types", "masks", "pools", "mixed",
+         "length", "branches", "registers", "slots", "unclassified"]
 
 
 def main(argv: list[str] | None = None) -> int:

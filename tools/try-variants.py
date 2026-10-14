@@ -2,21 +2,25 @@
 
 """Compile several candidate bodies for one function and report what each produces.
 
-This is the loop that actually closes frame-size mismatches, and it is worth a
-real tool because doing it by hand is both slow and easy to get wrong: the
-source has to be patched, one object rebuilt, the target object read back, and
-the original restored even when something throws halfway through.
+Doing this by hand is slow and easy to get wrong: the source has to be patched,
+one object rebuilt, the target object read back, and the original restored even
+when something throws halfway through.
 
-The output is the only thing that decides anything -- frame size against the
-target's, byte-identity, and code length. A variant that reaches the right frame
-but the wrong length told you the shape is plausible and the body is not.
+Variants are judged on CODE, not on the frame. Stack displacements and the
+`stwu` size are masked out before comparing, because AI work matches "up to
+stack frame size" (maintainer rule, 2026-10-13): padding locals, operand swaps, alignment
+tricks and inline choices made to fit the frame are all banned. A variant whose
+only effect is to move the frame is reported as FRAME-ONLY and --keep refuses
+it. Each variant is compared both against the target and against the untouched
+source, so a frame-only change is caught even when it happens to land on the
+target's frame.
 
 It rebuilds a single object, not the tree, so a sweep of half a dozen variants
 takes seconds.
 
 Variants file format -- a name line starting with '===', then the body:
 
-    === scalar result
+    === loop
     	int result = getResultFromAng(unk13C[0]);
     	for (int i = 1; i < 3; ++i) {
     		if (getResultFromAng(unk13C[i]) != result)
@@ -24,8 +28,8 @@ Variants file format -- a name line starting with '===', then the body:
     	}
     	return result;
 
-    === three-element array
-    	int results[3];
+    === unrolled
+    	int result = getResultFromAng(unk13C[0]);
     	...
 
 The body replaces everything between the function's opening and closing brace.
@@ -130,6 +134,30 @@ def find_function(text, signature):
     sys.exit(f"unbalanced braces in {signature!r}")
 
 
+def mask_frame(code):
+    """Code words with every stack-frame immediate zeroed.
+
+    Covers `stwu r1,-N(r1)`, D-form loads and stores off r1, and `addi rX,r1,N`.
+    What is left is the code the frame cannot explain.
+    """
+    out = []
+    for i in range(0, len(code) - len(code) % 4, 4):
+        w = int.from_bytes(code[i:i + 4], "big")
+        op, ra = w >> 26, (w >> 16) & 0x1F
+        if ra == 1 and (op == 14 or 32 <= op <= 55):
+            w &= 0xFFFF0000
+        out.append(w)
+    return out
+
+
+def code_diff(a, b):
+    """Masked word differences, or None if the lengths differ."""
+    ma, mb = mask_frame(a), mask_frame(b)
+    if len(ma) != len(mb):
+        return None
+    return sum(x != y for x, y in zip(ma, mb))
+
+
 def build(obj_rel, env):
     r = subprocess.run(["ninja", obj_rel], cwd=root_dir, capture_output=True, text=True, env=env)
     if r.returncode == 0:
@@ -178,12 +206,12 @@ def main(argv=None):
     # defines exactly one candidate, otherwise ask rather than guess.
     target_funcs = sfd.read_functions(target_obj)
     symbol = args.symbol
+    err = build(obj_rel, env)
+    if err:
+        shutil.move(backup, src)
+        sys.exit(f"baseline build failed: {err}")
+    ours = sfd.read_functions(our_obj)
     if not symbol:
-        err = build(obj_rel, env)
-        if err:
-            shutil.move(backup, src)
-            sys.exit(f"baseline build failed: {err}")
-        ours = sfd.read_functions(our_obj)
         method = args.signature.split("(")[0].split("::")[-1].split()[-1]
         cands = [s for s in ours if s.startswith(method + "__") and s in target_funcs]
         if len(cands) != 1:
@@ -197,9 +225,20 @@ def main(argv=None):
         shutil.move(backup, src)
         sys.exit(f"{symbol} is not in the target object {target_obj}")
     tframe, tlen = sfd.frame_size(tgt), len(tgt)
+    base = ours.get(symbol)
+    if base is None:
+        shutil.move(backup, src)
+        sys.exit(f"{symbol} is not in our object {our_obj}")
+
+    def describe(code):
+        d = code_diff(code, tgt)
+        if d is None:
+            return f"{len(code):>4}/{tlen} bytes"
+        return f"{len(code):>4}/{tlen} bytes, {d} word(s) off"
 
     print(f"\n{symbol}")
-    print(f"target: frame 0x{tframe:x}, {tlen} bytes\n")
+    print(f"target:   frame 0x{tframe:x}, {tlen} bytes")
+    print(f"baseline: frame 0x{sfd.frame_size(base):x}, {describe(base)}\n")
 
     keep, width = None, max(len(n) for n, _ in variants)
     try:
@@ -215,15 +254,23 @@ def main(argv=None):
                 print(f"  {name:<{width}}  symbol vanished (inlined away?)")
                 continue
             frame = sfd.frame_size(code)
-            if code == tgt:
+            frame_only = code != base and code_diff(code, base) == 0
+            if code == tgt and not frame_only:
                 verdict = "*** BYTE IDENTICAL ***"
-            elif frame == tframe:
-                verdict = "frame OK, code differs"
+            elif frame_only:
+                verdict = "FRAME-ONLY: same code as baseline, banned lever"
+            elif code == base:
+                verdict = "no change"
+            elif code_diff(code, tgt) == 0:
+                verdict = "code matches, frame differs"
             else:
-                verdict = f"frame {frame - tframe:+d}"
-            print(f"  {name:<{width}}  frame 0x{frame:<4x} {len(code):>4}/{tlen} bytes   {verdict}")
+                verdict = "code differs"
+            print(f"  {name:<{width}}  frame 0x{frame:<4x} {describe(code)}   {verdict}")
             if args.keep and name == args.keep:
-                keep = patched
+                if frame_only:
+                    print(f"  refusing --keep {name}: it only moves the frame")
+                else:
+                    keep = patched
     finally:
         io.open(src, "w", encoding="utf-8", newline="").write(keep if keep else original)
         build(obj_rel, env)

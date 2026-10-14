@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """Cancel each function's frame delta with a throwaway local, then count what is
-left -- the `char trash[0x40];` diagnostic, run over a whole unit.
+left. This is the `char trash[0x40];` diagnostic, run over a whole unit.
 
 Why it exists: when our frame is the wrong size, every stack displacement in the
 function shifts, so objdiff renders a wall of `~` lines and the real code
@@ -9,7 +9,8 @@ mismatch underneath is invisible. Sizing a throwaway local to the delta cancels
 the shift and the diff becomes readable. A function that drops to 0-3 residual
 differences is ONE real fix away; a function that stays at 40 has genuine
 structural work left. That ranking is the whole point -- it tells you where to
-spend the next hour.
+spend the next hour. A residual of 0 means the function is done for AI work:
+the frame itself is left for humans (maintainer rule, 2026-10-13).
 
 The scaffold is a DIAGNOSTIC. This script always restores the file, on success,
 on failure, and on Ctrl-C. It must never reach a commit: `review-lint.py`'s
@@ -45,9 +46,9 @@ def failing_functions(unit):
         report = json.load(f)
     for u in report["units"]:
         if u["name"] == unit:
-            out = [(fn["name"], float(fn["fuzzy_match_percent"]))
+            out = [(fn["name"], float(fn.get("fuzzy_match_percent", 0)))
                    for fn in u["functions"]
-                   if float(fn["fuzzy_match_percent"]) < 100.0]
+                   if float(fn.get("fuzzy_match_percent", 0)) < 100.0]
             out.sort(key=lambda r: -r[1])
             return out
     sys.exit(f"unit not found in report.json: {unit}")
@@ -57,7 +58,7 @@ def diff_text(unit, short):
     # Wide context on purpose: at -C 0 objdiff elides every matching line, so a
     # prologue whose frame already agrees is invisible and the frame cannot be
     # read at all. The diff count only looks at ~/</> lines, so context is free.
-    r = subprocess.run([sys.executable, DIFF, "-u", unit, "-d", short, "-C", "500"],
+    r = subprocess.run([sys.executable, DIFF, "-u", unit, "-d", short, "--no-collapse"],
                        cwd=root_dir, capture_output=True, text=True)
     return r.stdout
 
@@ -92,7 +93,7 @@ def parse_diff(text):
 
 
 BRACE = re.compile(r"\{([^}]*)\}")
-REG = re.compile(r"^r\d+$")
+REG = re.compile(r"^[rf]\d+$")
 SLOT = re.compile(r"^-?0x[0-9a-f]+$")
 
 
@@ -128,7 +129,7 @@ def classify(text):
             real.append(line)
         elif lb and all(REG.match(v) for v in lb + rb):
             regperm.append(line)
-        elif lb and all(SLOT.match(v) for v in lb + rb):
+        elif lb and all(SLOT.match(v) or REG.match(v) for v in lb + rb) and "(r1)" in left and "(r1)" in right:
             slot.append(line)
         else:
             real.append(line)
@@ -209,7 +210,10 @@ def main():
                 rows.append((short, pct0, delta, nd0, None, "build failed"))
                 print(f"  {short:<26} delta {delta:+5d}  BUILD FAILED")
                 continue
-            t2, o2, nd1, pct1 = parse_diff(diff_text(args.unit, short))
+            diagnostic = diff_text(args.unit, short)
+            t2, o2, nd1, pct1 = parse_diff(diagnostic)
+            real, regperm, slots = classify(diagnostic)
+            print(f"    real {len(real)}, regperm {len(regperm)}, slots {len(slots)}")
             note = "frame cancelled" if t2 == o2 else f"still {t2 - o2:+d}"
             rows.append((short, pct0, delta, nd0, nd1, note))
             print(f"  {short:<26} delta {delta:+5d}  {nd0:>4} -> {nd1:<4} "

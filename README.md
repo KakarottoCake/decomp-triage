@@ -60,6 +60,13 @@ values while generating identical code, and most edits break the match you have.
 population differs by the arithmetic minimum. If you want matches rather than archaeology,
 work the **structural** bucket.
 
+**For AI agents, frame-only is not work at all.** The doldecomp/sms maintainer's rule
+(2026-10-13) is that AI matches up to stack frame size: padding locals, operand swaps,
+alignment tricks and inlines chosen to fit the frame are all banned. The tools enforce it:
+`try-variants.py` refuses variants that only move the frame, `gen-variants.py` leaves
+`decl-order` off by default, and `review-lint.py` flags padding. If your project allows
+frame work, those defaults are easy to change; the measurements below still hold.
+
 `--by-idiom` is usually more useful than the per-file view: in a rushed, copy-pasted
 codebase the same virtual exists dozens of times, so one reconstruction can be worth a
 dozen matches.
@@ -182,12 +189,18 @@ distinction.
 python tools/try-variants.py src/Foo.cpp 'int TFoo::bar()' variants.txt
 ```
 
-Compiles several candidate bodies for one function and reports frame size against target,
-byte-identity, and length. Rebuilds a single object, so a sweep is seconds. Restores your
-source on success, failure, and Ctrl-C.
+Compiles several candidate bodies for one function and judges each on code with the frame
+masked out (the `stwu` size, loads and stores off `r1`, `addi rX,r1,N`). Every variant is
+compared with the target and with the untouched source. Verdicts: `BYTE IDENTICAL`,
+`code matches, frame differs`, `code differs` (with a masked word count when lengths
+agree), `no change`, and `FRAME-ONLY` when the code is the same as the original and only
+the frame moved. `--keep` refuses a `FRAME-ONLY` variant. Rebuilds a single object, so a
+sweep is seconds. Restores your source on success, failure, and Ctrl-C.
 
-A variant that reaches the right frame but the wrong length tells you the shape is
-plausible and the body isn't — which is more than a percentage ever tells you.
+Checked on a real function: an `int results[3]` padding variant moved the frame 0x20 to
+0x30 with identical code, came back `FRAME-ONLY`, and `--keep` refused it.
+
+Set `DECOMP_NINJA_DIR` if a specific ninja has to come first on PATH.
 
 ### `gen-variants.py` — the candidates
 
@@ -204,10 +217,12 @@ Eight families, safest first: `bool`, `compare`, `return`, `decl-order`, `local-
 `reassociate` (integers only — reassociating floats changes results), `param-inversion`,
 `bitfield`.
 
-`decl-order` is the one to reach for on a frame or register-colouring miss; it is the only
-family that moves layout rather than arithmetic. Measured on one already-matching function:
-writing a condition as `x != 0` instead of `x` moved the frame by +8 while emitting the same
-number of code bytes, so the `bool` family is a genuine frame lever too.
+Defaults are `bool,compare,return,local-form`. `decl-order` is off by default: it only
+recolours registers and moves slots, so its one use is a frame or register miss. Measured on
+one already-matching function: writing a condition as `x != 0` instead of `x` moved the
+frame by +8 at the same code size. That is why a respelling chosen for its frame effect is
+a fakematch, and why `try-variants.py` reports one as `FRAME-ONLY`. Use these families on a
+length or arithmetic miss.
 
 What it will **not** generate, by design: `volatile` locals, empty switch cases to reshape a
 jump table, and `#pragma` peephole/scheduling/fp_contract toggles. Those close byte gaps by
@@ -227,12 +242,21 @@ is a signature of source invented to reach a match, and **a wrong function can m
 100%**, so no build check will ever catch them:
 
 - **write-only-array** — a local array read only at `[0]`, usually there to move the frame.
+- **top-declared-locals** (advisory): a function body that opens with three or more
+  uninitialised declarations, which is Ghidra's layout rather than the original authors'.
 - **raw-offset-cast** — reaching a field via `*(T*)((u8*)p + 0xNN)`. It encodes a layout
   guess nothing verifies. Measured across 579 files on the source project: 10 hits, so it
   is high-signal rather than noise.
 - **invented-helper-dead / -single** — a file-local `static` helper that is never
   referenced, or has exactly one call site. Headers are exempt: an inline in a class
   header is that class's API, not a guess about a translation unit.
+
+The example rule set now also carries the doldecomp/sms maintainer's cleanup rules:
+`agent-note` (TODO, frame-size or match notes in comments), `this-arrow`, `quote-include`,
+`goto`, `frame-padding` (`PAD_STACK`, volatile locals), `ghidra-name` (`uVar3`, `fVar2`),
+`extern-function`, `sizeof-count`, plus advisory ones for new comments, accessor spellings
+and fabricated inlines placed in shared headers. Rules take two optional fields: `raw: true`
+matches with comments kept, and `only: [".cpp"]` limits a rule to file suffixes.
 
 Two calibrations in `invented-helper` are worth knowing before you tune it. It counts
 *every* mention of the name, not `name(`, because a callback handed to the engine is

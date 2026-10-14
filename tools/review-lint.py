@@ -52,7 +52,8 @@ SELF_DEFINING: tuple = ()
 
 
 class Rule:
-    def __init__(self, rid, pattern, message, fix, source, advisory=False, skip=()):
+    def __init__(self, rid, pattern, message, fix, source, advisory=False, skip=(),
+                 raw=False, only=()):
         self.id = rid
         self.re = re.compile(pattern, re.M)
         self.message = message
@@ -60,6 +61,10 @@ class Rule:
         self.source = source
         self.advisory = advisory
         self.skip = tuple(skip)
+        # raw: match with comments kept (strings still blanked), for rules about
+        # comments themselves. only: file suffixes the rule applies to.
+        self.raw = raw
+        self.only = tuple(only)
 
 
 def load_rules(path=None):
@@ -90,7 +95,8 @@ def load_rules(path=None):
         try:
             out.append(Rule(rec["id"], rec["pattern"], rec["message"], rec["fix"],
                             rec.get("source", ""), rec.get("advisory", False),
-                            rec.get("skip", ())))
+                            rec.get("skip", ()), rec.get("raw", False),
+                            rec.get("only", ())))
         except (KeyError, re.error) as exc:
             sys.exit(f"{path}:{n}: bad rule: {exc}")
     return out
@@ -110,9 +116,9 @@ def changed_lines(base):
         diff = subprocess.run(
             ["git", "diff", "-U0", f"{base}...HEAD", "--", "*.cpp", "*.hpp", "*.h"],
             # Decode explicitly. `text=True` uses the locale codec, which on
-            # Windows is cp1252 and cannot decode non-Latin string literals
-            # (this tree has Japanese ones) -- git then hands back None and the
-            # caller dies on `None.splitlines()` with no hint as to why.
+            # Windows is cp1252 and cannot decode the Japanese string literals
+            # this tree contains -- git then hands back None and the caller
+            # dies on `None.splitlines()` with no hint as to why.
             cwd=root_dir, capture_output=True, check=True,
         ).stdout.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError as exc:
@@ -134,9 +140,11 @@ def changed_lines(base):
 
 def strip_noise(line):
     """Blank out string literals and comments so rules don't fire inside them."""
-    line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
-    line = re.sub(r"//.*$", "", line)
-    return line
+    return re.sub(r"//.*$", "", strip_strings(line))
+
+
+def strip_strings(line):
+    return re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
 
 
 def write_only_arrays(text, wanted):
@@ -227,6 +235,35 @@ def invented_helpers(text, wanted, path):
     return hits
 
 
+DECL = re.compile(
+    r"^[ \t]+(?:const\s+)?(?:unsigned\s+|signed\s+)?[A-Za-z_][\w:<>]*[\s*&]+"
+    r"\w+(?:\s*,\s*[*&]?\s*\w+)*\s*;\s*(?://.*)?$")
+
+
+def top_declared_locals(text, wanted):
+    """Functions whose body opens with a block of uninitialised declarations.
+
+    That is Ghidra's layout, not the original authors'. The maintainer wants locals
+    declared where they are first used. Three in a row is the threshold: one or
+    two at the top is often just where they are first needed.
+    """
+    hits = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line != "{" or i == 0 or not re.search(r"\)\s*(?:const\s*)?$", lines[i - 1]):
+            continue
+        j = i + 1
+        while j < len(lines) and DECL.match(lines[j]) and not re.match(r"^\s*return\b", lines[j]):
+            j += 1
+        if j - (i + 1) < 3:
+            continue
+        lineno = i + 2
+        if wanted is not None and not (set(range(lineno, j + 1)) & wanted):
+            continue
+        hits.append((lineno, j - (i + 1)))
+    return hits
+
+
 def scan(path, wanted, rules):
     full = os.path.join(root_dir, path)
     if not os.path.isfile(full):
@@ -239,12 +276,15 @@ def scan(path, wanted, rules):
         if wanted is not None and n not in wanted:
             continue
         line = strip_noise(raw)
+        with_comments = strip_strings(raw)
         for rule in rules:
             if any(s in path for s in SELF_DEFINING) or any(s in path for s in rule.skip):
                 continue
+            if rule.only and not path.endswith(rule.only):
+                continue
             if f"review-lint: ignore {rule.id}" in raw:
                 continue
-            if rule.re.search(line):
+            if rule.re.search(with_comments if rule.raw else line):
                 findings.append((n, rule.id, rule.message, rule.fix, rule.source,
                                  raw.strip(), rule.advisory))
 
@@ -252,12 +292,23 @@ def scan(path, wanted, rules):
         findings.append((
             lineno, "write-only-array",
             f"{name}[{size}] is declared but only {name}[0] is ever read",
-            "if this exists to move the stack frame, say so in the commit message "
-            "-- it reads as fitted to the compiler, and readable source usually "
-            "outranks a match",
-            "built in: the signature of a match bought with unnatural source",
+            "if it exists to move the stack frame, delete it and leave the frame "
+            "unmatched. Locals that only pad the frame are banned for AI work",
+            "built in; maintainer rule 2026-10-13: AI matches up to stack frame size, no "
+            "padding locals",
             f"{name}[{size}]", False,
         ))
+
+    if path.endswith((".c", ".cpp")):
+        for lineno, count in top_declared_locals(text, wanted):
+            findings.append((
+                lineno, "top-declared-locals",
+                f"function opens with {count} uninitialised declarations",
+                "declare each local where it is first assigned; the devs did not "
+                "write C89-style blocks, Ghidra does",
+                "maintainer: few temporaries, locals declared where used",
+                text.splitlines()[lineno - 1].strip(), True,
+            ))
 
     for lineno, name, kind, msg in invented_helpers(text, wanted, path):
         findings.append((
@@ -279,14 +330,21 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true", help="explain every rule and exit")
     ap.add_argument("--rules", help=f"rule file (default tools/{RULES_FILE})")
     args = ap.parse_args(argv)
+    # The Windows console codec is cp1252; a Shift-JIS string in a snippet would
+    # otherwise kill the run halfway through the file list.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     if args.list:
         for r in load_rules(args.rules):
             tag = "  [advisory]" if r.advisory else ""
             print(f"{r.id}{tag}\n  flags  {r.message}\n  fix    {r.fix}\n  from   {r.source}\n")
         print("write-only-array\n  flags  a local array where only [0] is read\n"
-              "  fix    keep it only if the commit message explains why\n"
-              "  from   PR #134 getSlotResult\n")
+              "  fix    delete it; frame-only padding is banned for AI work\n"
+              "  from   PR #134 getSlotResult; maintainer rule 2026-10-13\n")
+        print("top-declared-locals  [advisory]\n  flags  a function that opens with "
+              "three or more uninitialised declarations\n"
+              "  fix    declare each local where it is first assigned\n"
+              "  from   maintainer: locals are declared where used, not C-style\n")
         return 0
 
     all_rules = load_rules(args.rules)

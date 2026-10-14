@@ -16,6 +16,11 @@ and maintainability are paramount. Accordingly:
   - BANNED: 'volatile' (no adding volatile locals or volatile reads to force stack slots)
   - BANNED: 'switch-padding' (no adding empty switch cases)
   - BANNED: 'pragma' (no wrapping in #pragma peephole / scheduling / fp_contract)
+  - FRAME RULE (maintainer rule, 2026-10-13): AI work matches up to stack frame size.
+    A respelling chosen because it moves the frame is banned, so 'decl-order',
+    which only recolours registers and moves slots, is off by default, and
+    try-variants.py refuses any variant whose only effect is the frame. Use
+    these families on a length or arithmetic miss.
   - DELIBERATELY ABSENT: 'cast' and 'width' (sign/width changes alter semantics
     and require human domain knowledge).
 
@@ -32,7 +37,7 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_FAMILIES = ["bool", "compare", "return", "decl-order", "local-form"]
+DEFAULT_FAMILIES = ["bool", "compare", "return", "local-form"]
 ALL_FAMILIES = [
     "bool",
     "compare",
@@ -48,7 +53,7 @@ FAMILY_DESCRIPTIONS = {
     "bool": "toggle between `x`, `x != 0`, `x != FALSE`, `x == TRUE` in conditions",
     "compare": "comparison aliases of the same test (a > b <-> b < a, !(a == b) <-> a != b)",
     "return": "`return TRUE;`/`return FALSE;` vs returning a variable already holding that value",
-    "decl-order": "permute adjacent local declarations (capped at 6 permutations)",
+    "decl-order": "permute adjacent local declarations (capped at 6 permutations); moves registers and frame only, so off by default",
     "local-form": "introduce named local for subexpression occurring >1 time, and the reverse",
     "reassociate": "permute and parenthesize 3-term integer additions (skips floats)",
     "param-inversion": "hoist call argument into temp declared immediately above call",
@@ -57,7 +62,7 @@ FAMILY_DESCRIPTIONS = {
 
 
 def print_family_list():
-    print("Available families (default: bool,compare,return,decl-order,local-form):")
+    print(f"Available families (default: {','.join(DEFAULT_FAMILIES)}):")
     for f in ALL_FAMILIES:
         print(f"  {f:<16} {FAMILY_DESCRIPTIONS[f]}")
     print("\nDeliberately absent (change semantics; must be human decisions):")

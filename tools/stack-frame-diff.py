@@ -42,13 +42,27 @@ Two things make a frame-only case more tractable, and both are worth sorting on:
   * CLUSTERING. Eight copy-paste siblings that all want the same delta are one
     insight, not eight problems.
 
+NOT AI WORK. Maintainer rule, 2026-10-13: AI matches "up to stack frame size". A
+frame-only function is finished as far as an agent is concerned; leave it
+unmatched. Padding locals, operand swaps, alignment tricks and choosing inlines
+to fit the frame are all banned, labelled or not. He will pad frames himself
+once the game is near 99%. An inline that fixes the frame AND changes code at
+~10 call sites is still fair game, but that is found from the code side, not by
+sweeping this list.
+
+Corollary: never choose a source spelling because of what it does to the frame.
+`x != 0` instead of `x` really does move a frame by 8 bytes at identical code
+size. That is a measurement, not a licence -- see the retraction on
+`source-spelling-families` in levers.jsonl.
+
 If you want cheap matches, look at the "other" bucket instead: frame already
 correct, code differs. Those are register allocation, scheduling and expression
 order -- they have a gradient, and the usual tools work on them.
 
+To find out what is actually in a frame and which inlined call put it there,
 Working out what is actually in a frame needs a compiler-state dumper, which is
-outside what this script does; this script exists to tell you *which* functions
-are worth pointing one at, across the whole tree at once.
+outside what this script does; this script exists to tell you
+*which* functions are worth pointing it at, across the whole tree at once.
 
 Usage
 -----
@@ -359,7 +373,8 @@ def main(argv: list[str]) -> int:
     failing = len(frame_only) + mixed + other + regperm
     print("\n" + "-" * 72)
     print("  %d functions compared, %d byte-identical, %d failing" % (compared, identical, failing))
-    print("  FRAME-ONLY  %5d   only the frame size is wrong -- hard: no gradient to climb" % len(frame_only))
+    print("  FRAME-ONLY  %5d   only the frame size is wrong -- not AI work, leave "
+          "unmatched" % len(frame_only))
     print("  frame+other %5d   frame differs and so does the code" % mixed)
     print("  regperm     %5d   identical but for register choice -- allocator wall, skip these" % regperm)
     print("  other       %5d   frame agrees, structural differences -- start here" % other)
